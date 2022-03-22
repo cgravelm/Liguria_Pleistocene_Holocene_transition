@@ -1,0 +1,588 @@
+---
+title: "Random Forest for site survey"
+author: "Claudine Gravel-Miguel"
+date: "3/21/2022"
+output: html_document
+---
+
+In this document, I train a random forest model using Spanish archaeological sites to identify where sites might be in Liguria.
+
+As predictors, I use the popularity map created by the AB_LCP, a DEM, the distance from rivers and coast, and the geology at documented caves.
+
+```{r setup, include = F}
+
+library(tidyverse)
+library(here) # will help with the paths
+library(sp)
+library(rgdal)
+library(raster)
+
+knitr::opts_chunk$set(warning=F, message=F, echo =F) # Setting up the chunk settings for all chunks
+
+```
+
+```{r setup the projections}
+
+# Setup some projections
+crs_lat_long <- 'GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["Degree",0.017453292519943295]]'
+
+crs_spain <- 'PROJCS["WGS_1984_UTM_Zone_30N",GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["False_Easting",500000.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",-3.0],PARAMETER["Scale_Factor",0.9996],PARAMETER["Latitude_Of_Origin",0.0],UNIT["Meter",1.0]]'
+
+crs_liguria <- 'PROJCS["WGS_1984_UTM_Zone_32N",GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["False_Easting",500000.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",9.0],PARAMETER["Scale_Factor",0.9996],PARAMETER["Latitude_Of_Origin",0.0],UNIT["Meter",1.0]]'
+
+```
+
+# Spanish sites during the transition
+
+For the grant proposal, I already cleaned the Vermeersch v27 database to focus on sites with reliable radiocarbon dates, and I calibrated them. So, here I simply imported it and focused on the Spanish sites of the right time period.
+
+```{r importing the Spanish sites}
+
+# As the R project is in the top LiguriaProject folder, with the 'here' package, I can call any file in its subfolders.
+
+european_radiocarbon_db <- read_csv(here("../Application/code/cleaned_Oxcal_cal.csv")) %>%
+  filter(date_pm < 300, # focusing on dates with lower error ranges
+         between(age.start, -12000, -8000) | between(age.end, -12000, -8000)) %>% 
+  distinct(g_coord_long, g_coord_lat, .keep_all = T) %>% 
+  distinct(g_sitename, .keep_all = T) # And keep only one instance of each site (need to filter by coordinates and by name to catch most typos)
+
+spanishSites <- european_radiocarbon_db %>%   # the .. allows to go one folder up.
+  filter(g_country.y == "Spain",
+         g_coord_long < -2, # some sites had completely off coordinates
+         g_coord_lat > 41) 
+
+# Import the polygon of the region considered here. This will be used to filter out the points we don't need.
+SpainPolygon <- readOGR("../../GISdata/Cantabria_Buffer.shp", verbose = F)
+crs(SpainPolygon) <- crs_lat_long
+r <- raster(ncol=180, nrow=180)
+extent(r) <- extent(SpainPolygon)
+SpainPolygonRas <- rasterize(SpainPolygon, r)
+
+spanishSites$Polygon <- extract(x = SpainPolygonRas, 
+                                y = SpatialPoints(cbind(spanishSites$g_coord_long,
+                                                        spanishSites$g_coord_lat)))
+
+# Remove the sites outside the polygon
+spanishSites <- spanishSites %>% 
+  filter(!is.na(Polygon))
+  
+ggplot(spanishSites) +
+  geom_point(aes(x=g_coord_long, y=g_coord_lat))
+
+# cleaning up
+rm(r, SpainPolygon)
+
+```
+
+# Known Italian sites during the transition
+
+```{r importing the Italian sites}
+
+# As the R project is in the top LiguriaProject folder, with the 'here' package, I can call any file in its subfolders.
+
+italianSites <- european_radiocarbon_db %>% 
+  filter(g_country.y == "Italy",
+         g_coord_long < 20, # some sites had completely off coordinates
+         g_coord_lat > 36) 
+
+ItalyPolygon <- readOGR("../../GISdata/Italian_Polygon.shp", verbose = F)
+crs(ItalyPolygon) <- crs_lat_long
+r <- raster(ncol=180, nrow=180)
+extent(r) <- extent(ItalyPolygon)
+ItalyPolygonRas <- rasterize(ItalyPolygon, r)
+
+italianSites$Polygon <- extract(x = ItalyPolygonRas, 
+                                y = SpatialPoints(cbind(italianSites$g_coord_long,
+                                                        italianSites$g_coord_lat)))
+
+# Remove the sites outside the polygon
+italianSites <- italianSites %>% 
+  filter(!is.na(Polygon))
+
+ggplot(italianSites) +
+  geom_point(aes(x=g_coord_long, y=g_coord_lat))
+
+# cleaning up
+rm(r, ItalyPolygon)
+
+```
+
+# Importing caves shapefiles
+
+I obtained the location of caves from the OpenStreetMap project. I am first cleaning the datasets and formatting it in the same way as the archaeological sites datasets. Then, I will join the two so that caves with archaeology have the MesoArch variable as TRUE and the caves who do not (or for which we do not have known presence) will have the variable as FALSE.
+
+To make sure that my join actually links the same caves even if there are typos, I'm simplifying the site names and using those names for the join.
+
+```{r importing shapefiles, results = "hide"}
+
+# As this is a open source dataset, there can be duplicates and typos, so I need to clean the data first
+cleanOSM <- function(path){
+  
+  ds <- data.frame(readOGR(path), verbose = F) # read the shapefile and converts to dataframe
+  trial <- ds %>% 
+    filter(!is.na(name)) %>% # remove the caves without names
+    distinct(name, .keep_all = T) %>% # keep only one of duplicates
+    dplyr::select(name=name, desc=descriptio, historic, lat=coords.x2, long=coords.x1)
+  
+}
+
+spanishCaves <- cleanOSM("../../GISdata/Caves/CantabriaCavesFiltered.shp")
+ligurianCaves <- cleanOSM("../../GISdata/Caves/LiguriaCavesFiltered.shp")
+
+```
+
+```{r only caves within polygons}
+
+ligurianCaves$Polygon <- extract(x = ItalyPolygonRas, 
+                                y = SpatialPoints(cbind(ligurianCaves$long,
+                                                        ligurianCaves$lat)))
+
+# Remove the sites outside the polygon
+ligurianCaves <- ligurianCaves %>% 
+  filter(!is.na(Polygon))
+
+spanishCaves$Polygon <- extract(x = SpainPolygonRas, 
+                                y = SpatialPoints(cbind(spanishCaves$long,
+                                                        spanishCaves$lat)))
+
+# Remove the sites outside the polygon
+spanishCaves <- spanishCaves %>% 
+  filter(!is.na(Polygon))
+
+# no need of the polygons anymore
+rm(ItalyPolygonRas, SpainPolygonRas)
+
+```
+
+```{r functions to simplify names}
+
+library(stringi)
+
+wordstoremove <- c("Arma ", "Grotte ", "Abri ", "Grotta ", "Abrigo ", "du ", "de ", "del ", "degli ", "della ", "delle ", "la ", "des ", "à ", "l' ", "Aven ", "Trou ", "Cueva ", "el ", "las ", "los ", "Torca ", "Sima ", "Cuevas ", "en ", "Sima-", "do ", "di ", "dei ", "da ", "dell'", "d'", "a ", "-", " I", " II", " III", " IV", " V", " VI", " VII", " VIII", " IX", " X" , " inf", ", ingresso est", ", ingresso ovest", "ingresso nord", "ingresso sud", "Caverna ", "dello", "Grotticella", "Inferiore", "Superiore", "Pozzetto", "Pozzo", "Riparo", "Sprugola", "Tana ", "Tanna ", "Tanazza ", "Tann-a ", "- ")
+
+cleaningFun <- function(ds){
+  
+  ds %>% 
+    stri_trans_general("Latin-ASCII") %>%  # removes accents
+    str_remove_all(fixed("(")) %>% # Remove "("s
+    str_remove_all(fixed(")")) %>% # Remove ")"s
+    str_remove_all(regex(str_c("\\b",wordstoremove, "\\b", collapse = '|'), ignore_case = T)) %>% 
+    str_remove_all("\\.") %>% 
+    str_replace_all("[:digit:]", "") %>% # removes any numbers
+    str_to_title() %>% # Title case
+    str_remove_all(" ") # remove spaces
+  
+}
+
+addCleanedNames <- function(ds){
+  
+  ds %>% 
+    mutate(nameCleaned = nameNoParen) %>%  # append that clean vector to the dataset
+    arrange(nameCleaned) # sort
+  
+}
+
+```
+
+```{r converting names to simple forms in Spain}
+
+# For caves
+nameNoParen <- spanishCaves$name %>%
+  cleaningFun()
+
+spanishCaves <- spanishCaves %>% 
+  addCleanedNames() %>% 
+  distinct(nameCleaned, .keep_all = T) # removing duplicates
+
+# For sites
+nameNoParen <- spanishSites$g_sitename %>%
+  cleaningFun()
+
+spanishSites <- spanishSites %>% 
+  addCleanedNames() %>% 
+  distinct(nameCleaned, .keep_all = T) # removing duplicates
+
+write_csv(spanishSites, "../../GISdata/Spanish_Mesolithic_Sites.csv") # I cleaned a few coordinates in QGIS
+
+```
+
+```{r merge caves and sites in Spain}
+
+# Get the Caves without archaeology (even if I delete some wrong names because of duplicates, it doesn't matter much given the number of caves)
+
+spanishSites <- read_csv("../../GISdata/Spanish_Mesolithic_Sites_Cleaned.csv") # reset as I adjusted some coordinates
+
+spanishNoArch <- spanishCaves %>% 
+  anti_join(spanishSites, by = "nameCleaned")
+
+# Format so I can merge the two datasets together
+spanishNoArch <- spanishNoArch %>% 
+  dplyr::select(name, nameCleaned, lat, long) %>% 
+  mutate(MesoArch = FALSE)
+
+spanish <- spanishSites %>% 
+  dplyr::select(name = g_sitename, nameCleaned, lat = g_coord_lat, long = g_coord_long) %>% 
+  mutate(MesoArch = TRUE) %>% 
+  rbind(spanishNoArch)
+
+# cleanup 
+rm(spanishCaves, spanishSites, spanishNoArch)
+
+```
+
+```{r merge caves and sites in Italy}
+
+# For caves
+nameNoParen <- ligurianCaves$name %>%
+  cleaningFun()
+
+ligurianCaves <- ligurianCaves %>% 
+  addCleanedNames() %>% 
+  distinct(nameCleaned, .keep_all = T) # removing duplicates
+
+# For sites
+nameNoParen <- italianSites$g_sitename %>%
+  cleaningFun()
+
+italianSites <- italianSites %>% 
+  addCleanedNames()
+
+write_csv(italianSites, "../../GISdata/Italian_Mesolithic_Sites.csv") # I cleaned a few coordinates in QGIS
+
+italianSites <- read_csv("../../GISdata/Italian_Mesolithic_Sites_Filtered.csv") # reset as I adjusted some coordinates and filtered the dataset by the Liguria shapefile
+
+liguriaNoArch <- ligurianCaves %>% 
+  anti_join(italianSites, by = "nameCleaned")
+
+# Format so I can merge the two datasets together
+liguriaNoArch <- liguriaNoArch %>% 
+  dplyr::select(name, nameCleaned, lat, long) %>% 
+  mutate(MesoArch = FALSE)
+
+liguria <- italianSites %>% 
+  dplyr::select(name = g_sitename, nameCleaned, lat = g_coord_lat, long = g_coord_long) %>% 
+  mutate(MesoArch = TRUE) %>% 
+  rbind(liguriaNoArch)
+
+# cleanup 
+rm(ligurianCaves, italianSites, liguriaNoArch)
+
+```
+
+# Import the predictor maps
+
+## Import the mobility maps
+
+In this section, I import the rasters created by the AB-LCP model and compile their results by adding their values (sum, ignoring NA).
+
+This map show the normalized summed mobility in Spain.
+
+```{r mobility in Spain}
+
+library(raster)
+  
+# Create a list of all the file names in the identified path folder
+all_files <- list.files(path = "../LCP_Outputs/modelOutputsSpain/", all.files = TRUE, full.names = TRUE, pattern = "\\.asc$")
+  
+all_maps <- stack(all_files)
+
+sum_mobility_spain <- sum(all_maps, na.rm = T)
+
+# standardize to 0-100
+sum_mobility_spain <- (sum_mobility_spain * 100) / maxValue(sum_mobility_spain)
+
+plot(sum_mobility_spain)
+
+rm(all_maps, all_files)
+
+```
+
+This map show the normalized summed mobility in Liguria.
+
+```{r mobility in Liguria}
+  
+# Create a list of all the file names in the identified path folder
+all_files <- list.files(path = "../LCP_Outputs/modelOutputsLiguria/", all.files = TRUE, full.names = TRUE, pattern = "\\.asc$")
+  
+all_maps <- stack(all_files)
+
+sum_mobility_liguria <- sum(all_maps, na.rm = T)
+
+sum_mobility_liguria <- (sum_mobility_liguria * 100) / maxValue(sum_mobility_liguria)
+plot(sum_mobility_liguria)
+
+rm(all_maps, all_files)
+
+```
+
+Those are then reprpjected to LatLong to fit the rest of the data.
+
+```{r reproject mobility and dem maps to Lat Long}
+
+reproject_to_Lat_long <- function(ras){
+  
+  projectRaster(ras, crs = crs_lat_long)
+  
+}
+
+crs(sum_mobility_spain) <- crs_spain
+sum_mobility_spain <- reproject_to_Lat_long(sum_mobility_spain)
+sum_mobility_spain <- round(sum_mobility_spain, 0)
+
+# now for Liguria
+crs(sum_mobility_liguria) <- crs_liguria
+sum_mobility_liguria <- reproject_to_Lat_long(sum_mobility_liguria)
+sum_mobility_liguria <- round(sum_mobility_liguria, 0)
+
+```
+
+## Import the other predictors
+
+Importing the maps of elevation, slope, distance from rivers, distance from coast, viewshed from summits, and geology. Formatting those to make sure that they are in the correct projection (Lat Long).
+
+```{r upload predictors}
+
+# the lat long DEM for both regions is the GMTED clipped file
+
+dem <- raster("../../GISdata/Merged_GMTED_GEBCO_Clipped_Sea_level.tif")
+slope <- raster("../../GISdata/Slope.tif")
+slope <- round(slope, 0) # rounding out decimals
+
+# dist from rivers (using r.walk in GRASS)
+liguria_dist_from_rivers <- raster("../../GISdata/Liguria_rWalk_from_rivers_1000.tif")
+liguria_dist_from_rivers <- reproject_to_Lat_long(liguria_dist_from_rivers)
+liguria_dist_from_rivers <- round(liguria_dist_from_rivers / 60, 0) # transforms the data in minutes
+
+spain_dist_from_rivers <- raster("../../GISdata/Spain_rWalk_from_rivers_1000.tif")
+spain_dist_from_rivers <- reproject_to_Lat_long(spain_dist_from_rivers)
+spain_dist_from_rivers <- round(spain_dist_from_rivers / 60, 0) # transforms the data in minutes
+
+# dist from coast (using r.walk in GRASS)
+liguria_dist_from_coast <- raster("../../GISdata/Liguria_rWalk_from_coast.tif")
+liguria_dist_from_coast <- reproject_to_Lat_long(liguria_dist_from_coast)
+liguria_dist_from_coast <- round(liguria_dist_from_coast / 60, 0) # transforms the data in minutes
+
+spain_dist_from_coast <- raster("../../GISdata/Spain_rWalk_from_coast.tif")
+spain_dist_from_coast <- reproject_to_Lat_long(spain_dist_from_coast)
+spain_dist_from_coast <- round(spain_dist_from_coast / 60, 0) # transforms the data in minutes
+
+# viewshed from summits
+spain_viewshed_from_summits <- raster("../../GISdata/Spain_View_from_Summits_norm.tif")
+spain_viewshed_from_summits <- reproject_to_Lat_long(spain_viewshed_from_summits)
+spain_viewshed_from_summits <- round(spain_viewshed_from_summits, 2)
+
+liguria_viewshed_from_summits <- raster("../../GISdata/Liguria_View_from_Summits_norm.tif")
+liguria_viewshed_from_summits <- reproject_to_Lat_long(liguria_viewshed_from_summits)
+liguria_viewshed_from_summits <- round(liguria_viewshed_from_summits, 2)
+
+# And some shapefiles
+geology <- readOGR(dsn = "../../GISdata/Geological_map_USGS.shp", verbose = F)
+geology <- geology['GLG'] # focusing only on the geology type
+
+```
+
+# Extracting raster values at caves' locations
+
+Here, we extract the values from the imported rasters (predictors) using the coordinates of the caves cleaned up earlier.
+
+For mobility and visibility from summit, the etxracting takes the max value within a 1 km radius around the point. For all other values, the value is at the point location.
+
+```{r set two maps to same extent}
+
+library(sp) # for extraction from shapefile
+
+extractRasterValues <- function(ras, ds){
+  
+  extract(ras, ds)
+  
+}
+
+liguria$mobility <- extract(sum_mobility_liguria, liguria[,c(4,3)], buffer = 1000, fun = max)
+liguria$dem <- extractRasterValues(dem, liguria[,c(4,3)])
+liguria$slope <- extractRasterValues(slope, liguria[,c(4,3)])
+liguria$dist_rivers <- extractRasterValues(liguria_dist_from_rivers, liguria[,c(4,3)])
+liguria$dist_coast <- extractRasterValues(liguria_dist_from_coast, liguria[,c(4,3)])
+liguria$visibility <- extract(liguria_viewshed_from_summits, liguria[,c(4,3)], buffer = 1000, fun = max)
+
+pts <- SpatialPoints(liguria[,c(4,3)], proj4string = CRS(proj4string(geology)))
+liguria$geology <- over(pts, geology)
+
+spanish$mobility <- extract(sum_mobility_spain, spanish[,c(4,3)], buffer = 1000, fun = max)
+spanish$dem <- extractRasterValues(dem, spanish[,c(4,3)])
+spanish$slope <- extractRasterValues(slope, spanish[,c(4,3)])
+spanish$dist_rivers <- extractRasterValues(spain_dist_from_rivers, spanish[,c(4,3)])
+spanish$dist_coast <- extractRasterValues(spain_dist_from_coast, spanish[,c(4,3)])
+spanish$visibility <- extract(spain_viewshed_from_summits, spanish[,c(4,3)], buffer = 1000, fun = max)
+
+pts <- SpatialPoints(spanish[,c(4,3)], proj4string = CRS(proj4string(geology)))
+spanish$geology <- over(pts, geology)
+
+rm(pts)
+
+```
+
+Here is a quick summary of the data. The first table shows the mean values for Spanish caves, and the second shows the mean for Ligurian caves.
+
+```{r overview of data}
+
+spanish %>% 
+  dplyr::select(mobility, dem, slope, distRivers = dist_rivers, distCoast = dist_coast, visibility) %>% 
+  summarize(across(everything(), list(min = min, mean = mean, max = max))) %>% 
+  gather(key = "key", value = "value") %>%
+  separate(key, c("variable", "stat"), sep = "_") %>%
+  pivot_wider(names_from = "stat", values_from = "value") 
+
+liguria %>% 
+  dplyr::select(mobility, dem, slope, distRivers = dist_rivers, distCoast = dist_coast, visibility) %>% 
+  summarize(across(everything(), list(min = min, mean = mean, max = max))) %>% 
+  gather(key = "key", value = "value") %>%
+  separate(key, c("variable", "stat"), sep = "_") %>%
+  pivot_wider(names_from = "stat", values_from = "value") 
+
+
+```
+
+This is actually telling me that there are values in Liguria (mobility and slope) that will not be encountered during training, which may be a problem as RF does not like that.
+
+# Random Forest
+
+I am training the random forest algorithm on the Spanish dataset to see if we can predict the presence of Mesolithic archaeology at sites
+
+```{r random forest algorithm}
+
+library(randomForest)
+library(pROC)
+
+runningRFmodel <- function(ds, trainSampSize, nTrees){
+  
+  # Dividing into training and test sets
+  # Determine the number of rows for training
+  n <- nrow(ds)
+  
+  # Create a random sample of row IDs
+  sample_rows <- sample(n, n*trainSampSize)
+  
+  # Create the training dataset
+  ds_train <- ds[sample_rows,]
+  
+  # Create the test dataset with the rows that are NOT in the training dataset
+  ds_test <<- ds[-sample_rows,]
+  
+  # Build a random forest model
+  ds_model <- randomForest(MesoArch~., data = ds_train, ntree = nTrees, type = "classification", na.action = na.omit)
+  
+  # test the model on the test dataset
+  ds_test$pred <<- predict(ds_model, ds_test, type = "response")
+  
+  # Compute the accuracy of the random forest
+  print(paste0("Mean accuracy on test data: ", mean(ds_test$pred == ds_test$MesoArch)))
+  
+  # Compute the ROC curve and AUC
+  rf.roc <- roc(ds_train$MesoArch, ds_model$votes[,2])
+  plot(rf.roc)
+  print(auc(rf.roc))
+ 
+  return(ds_model)
+}
+
+```
+
+Using seed 12, with 5000 trees and 50/50 training vs test dataset.
+
+```{r running the RF}
+
+set.seed(12) # for reproducibility
+# I actually tried a few seeds and 2, 8 give OK results for Spain, but most importantly, gets all three known sites in Liguria correctly. But those predict 100+ sites in Liguria. 12 is the best seed to use (predicts well AC, AV, and AS, but only identifies 63 more possible sites).
+
+spanish_full_for_RF <- spanish %>% 
+  dplyr::select(dem, mobility, slope, dist_rivers, dist_coast, visibility, geology, MesoArch) %>%
+  mutate(geology = unlist(geology)) %>% 
+  drop_na() %>% 
+  mutate(MesoArch = factor(MesoArch))
+
+minCat <- spanish_full_for_RF %>% 
+  count(MesoArch)
+
+minCat <- min(minCat$n)
+
+# Resample with replacement
+spanish_for_RF <- spanish_full_for_RF %>%
+  group_by(MesoArch) %>%
+  sample_n((minCat*4), replace=T) %>% 
+  ungroup()
+
+ds_model <- runningRFmodel(spanish_for_RF, 0.50, 5000)
+
+data.frame(ds_model$importance) %>% 
+  arrange(desc(MeanDecreaseGini))
+
+ds_model$confusion
+
+```
+
+When testing the model on the full dataset, it is pretty good. This is the percentage of caves that were correctly predicted:
+
+```{r test on full Spain dataset}
+
+spanish_full <- spanish %>% 
+  mutate(geology = unlist(geology)) %>%
+  drop_na()
+
+spanish_full$pred <- predict(ds_model, spanish_full_for_RF)
+
+sum(spanish_full$MesoArch == spanish_full$pred)/nrow(spanish_full)
+
+spanish_full <- spanish_full %>% 
+  mutate(geology = unlist(geology)) %>% 
+  mutate(prediction_type = ifelse(MesoArch == TRUE,
+                                  ifelse(pred == TRUE, "TruePositive", "FalseNegative"),
+                                  ifelse(pred == FALSE, "TrueNegative","FalsePositive")))
+
+write_csv(spanish_full, "../../GISdata/Spain_predicted.csv")
+
+```
+
+Applying the model to the Ligurian dataset, it predicts accurately the presence of Meso archaeology in the 3 sites with known archaeology from that period. This is satisfying for now.
+
+```{r apply model on Ligurian caves}
+
+liguria_for_RF <- liguria %>% 
+  dplyr::select(dem, mobility, slope, dist_rivers, dist_coast, geology, visibility) %>% 
+  mutate(geology = unlist(geology)) %>% 
+  filter(!is.na(dem))
+
+# test the model on the test dataset
+liguria$pred <- predict(ds_model, liguria_for_RF, type = "response")
+
+liguria %>% 
+  as_tibble() %>% 
+  dplyr::select(c(name, MesoArch, pred))
+
+# How many sites with Meso arch predicted?
+sum(liguria$pred == TRUE)
+
+```
+
+According to this model, these are the sites that we should look into for our surveys:
+
+```{r survey sites}
+
+liguria %>% 
+  filter(pred == TRUE) %>% 
+  dplyr::select(name) %>% 
+  arrange(name)
+
+liguria %>% 
+  ggplot() +
+  geom_point(aes(x=long, y=lat, color = pred))
+
+liguria <- liguria %>% 
+  mutate(geology = unlist(geology))
+
+write_csv(liguria, "../../GISdata/Liguria_predicted.csv")
+
+```
+
+That is a lot of sites, but fortunately, most of them are close to one another. We should expect a fair number of false positives, however.
+
+# The end
